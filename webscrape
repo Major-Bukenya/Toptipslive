@@ -1,0 +1,121 @@
+import asyncio
+from playwright.async_api import async_playwright
+import requests
+import time
+import re
+from bs4 import BeautifulSoup
+
+# 🔗 Your n8n webhook URL (replace with your actual URL)
+N8N_WEBHOOK_URL = "https://your-n8n.com/webhook/olbg-football-tips"
+
+async def scrape_and_send():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        print("🌐 Navigating to OLBG Football Tips...")
+        await page.goto("https://www.olbg.com/betting-tips/Football/1", timeout=60000)
+
+        # Wait for tip rows (adjust selector if needed)
+        try:
+            await page.wait_for_selector("tr.tip-row", timeout=30000)
+        except:
+            print("⚠️ 'tr.tip-row' not found. Trying generic table rows...")
+            await page.wait_for_selector("table tbody tr", timeout=30000)
+
+        # Get all rows
+        rows = await page.query_selector_all("tr.tip-row") or await page.query_selector_all("table tbody tr")
+        tips = []
+
+        for row in rows:
+            try:
+                html = await row.inner_html()
+                soup = BeautifulSoup(html, 'html.parser')
+
+                # --- Extract Match ---
+                match_elem = soup.select_one('a[href*="/match/"]')
+                match = match_elem.get_text(strip=True) if match_elem else None
+                if not match:
+                    continue  # Skip non-tip rows
+
+                # --- Extract Tip Type ---
+                tip_type = ""
+                tip_badge = soup.select_one('.tip-badge, [class*="tipType"]')
+                if tip_badge:
+                    tip_type = tip_badge.get_text(strip=True)
+
+                # --- Extract Odds ---
+                odds = ""
+                odds_elem = soup.select_one('[class*="odds"], [data-odds]')
+                if odds_elem:
+                    odds = odds_elem.get_text(strip=True).replace('Odds:', '').strip()
+
+                # --- Extract Confidence % ---
+                confidence = 0.0
+                conf_elem = soup.select_one('[class*="confidence"]')
+                if conf_elem:
+                    text = conf_elem.get_text()
+                    match_conf = re.search(r'(\d+\.?\d*)%', text)
+                    if match_conf:
+                        confidence = float(match_conf.group(1))
+
+                # --- Extract Value Rating (★) ---
+                value_rating = 0
+                # Method 1: Count filled stars
+                star_icons = soup.select('[class*="star"]:not([class*="empty"])')
+                if star_icons:
+                    value_rating = len(star_icons)
+                else:
+                    # Method 2: Look for star text like "★★★★☆"
+                    star_text_elem = soup.find(string=re.compile(r'[★☆\*]{3,}'))
+                    if star_text_elem:
+                        value_rating = star_text_elem.count('★') or star_text_elem.count('*')
+
+                # --- Extract Tipster ---
+                tipster_elem = soup.select_one('a[href*="/tipsters/"]')
+                tipster = tipster_elem.get_text(strip=True) if tipster_elem else "Anonymous"
+
+                # --- Extract League (optional) ---
+                league = "Unknown"
+                league_elem = soup.select_one('[class*="league"], [class*="competition"]')
+                if league_elem:
+                    league = league_elem.get_text(strip=True)
+
+                tips.append({
+                    "match": match,
+                    "tip_type": tip_type,
+                    "odds": odds,
+                    "confidence_percent": confidence,
+                    "value_rating": value_rating,
+                    "tipster": tipster,
+                    "league": league
+                })
+
+            except Exception as e:
+                print(f"⚠️ Row parse error: {e}")
+                continue
+
+        await browser.close()
+
+        if not tips:
+            print("❌ No tips extracted. Check selectors or page structure.")
+            return
+
+        print(f"✅ Extracted {len(tips)} tips. Sending to n8n...")
+
+        # Send to n8n webhook
+        try:
+            response = requests.post(
+                N8N_WEBHOOK_URL,
+                json={"tips": tips},
+                timeout=10
+            )
+            if response.status_code == 200:
+                print("📤 Successfully sent tips to n8n!")
+            else:
+                print(f"❌ n8n webhook failed: {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"❌ Error sending to n8n: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(scrape_and_send())
